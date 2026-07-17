@@ -77,38 +77,45 @@ def whatsapp_webhook():
 def check_followups():
     leads = load_leads()
     nudges_sent = 0
+    errors = []
 
     for lead_id, lead in leads.items():
-        date_received = datetime.fromisoformat(lead["date_received"])
-        days_since = (datetime.now() - date_received).days
+        try:
+            date_received = datetime.fromisoformat(lead["date_received"])
+            days_since = (datetime.now() - date_received).days
 
-        # Figure out which schedule day (if any) matches today
-        due_day = None
-        for day in FOLLOWUP_SCHEDULE:
-            if days_since >= day and day not in lead["followups_sent"]:
-                due_day = day
+            due_day = None
+            for day in FOLLOWUP_SCHEDULE:
+                if days_since >= day and day not in lead["followups_sent"]:
+                    due_day = day
 
-        # After day 30, repeat monthly (every 30 days) if not already nudged this month
-        if due_day is None and days_since > 30:
-            months_passed = days_since // 30
-            monthly_marker = f"month_{months_passed}"
-            if monthly_marker not in lead["followups_sent"]:
-                due_day = monthly_marker
+            if due_day is None and days_since > 30:
+                months_passed = days_since // 30
+                monthly_marker = f"month_{months_passed}"
+                if monthly_marker not in lead["followups_sent"]:
+                    due_day = monthly_marker
 
-        if due_day is not None:
-            nudge_text = draft_followup_nudge(lead["message"], days_since)
-            send_whatsapp_message(lead["broker_number"], nudge_text)
-            lead["followups_sent"].append(due_day)
-            nudges_sent += 1
+            if due_day is not None:
+                nudge_text = draft_followup_nudge(lead["message"], days_since)
+                send_whatsapp_message(lead["broker_number"], nudge_text)
+                lead["followups_sent"].append(due_day)
+                nudges_sent += 1
+
+        except Exception as e:
+            # One lead failing should never stop the rest from being processed
+            print(f"  ⚠️ Failed to process lead {lead_id}: {e}")
+            errors.append(str(lead_id))
+            continue
 
     save_leads(leads)
-    return {"status": "ok", "nudges_sent": nudges_sent}
+    return {"status": "ok", "nudges_sent": nudges_sent, "errors": errors}
 
 
-def draft_followup_nudge(original_message, days_since):
+def draft_followup_nudge(original_message, days_since, max_retries=2):
     """Uses AI to draft a short, useful check-in the broker can send —
     not a generic 'still interested?' but something that references the
-    original inquiry, so it feels personal, not automated."""
+    original inquiry, so it feels personal, not automated.
+    Retries on failure, falls back to a safe generic nudge if AI is unavailable."""
     prompt = f"""A real estate broker in Bangalore received this lead {days_since} days ago:
 "{original_message}"
 
@@ -117,12 +124,25 @@ can send to check in with this buyer. Reference something specific from their
 original message. Keep it warm and low-pressure, not salesy. Do not use placeholder
 brackets - write it as ready-to-send text."""
 
-    response = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6
-    )
-    draft = response.choices[0].message.content.strip()
+    draft = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = groq_client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.6,
+                timeout=15
+            )
+            draft = response.choices[0].message.content.strip()
+            break
+        except Exception as e:
+            print(f"  ⚠️ Nudge drafting attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(2)
+
+    if draft is None:
+        # Safe fallback - still nudges the broker even if AI is down
+        draft = "Just checking in on this lead - worth a quick follow-up message?"
 
     return (f"⏰ Reminder: it's been {days_since} days since this lead:\n"
             f"\"{original_message[:100]}\"\n\n"
@@ -135,23 +155,6 @@ def send_whatsapp_message(to_number, body):
         to=to_number,
         body=body
     )
-
-
-@app.route("/debug/backdate/<lead_id>/<int:days>")
-def debug_backdate(lead_id, days):
-    """
-    TEST-ONLY: artificially moves a lead's date back so we can trigger
-    follow-up logic immediately instead of waiting real calendar days.
-    Remove this route once testing is done.
-    """
-    leads = load_leads()
-    if lead_id not in leads:
-        return {"error": "lead_id not found"}, 404
-
-    new_date = datetime.now() - timedelta(days=days)
-    leads[lead_id]["date_received"] = new_date.isoformat()
-    save_leads(leads)
-    return {"status": "backdated", "lead_id": lead_id, "new_date": new_date.isoformat()}
 
 
 @app.route("/debug/leads")
