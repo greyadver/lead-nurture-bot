@@ -137,6 +137,12 @@ def send_whatsapp_message(to_number, body):
     )
 
 
+@app.route("/debug/leads")
+def debug_leads():
+    """Quick way to see what's actually stored right now, for testing."""
+    return load_leads()
+
+
 @app.route("/")
 def home():
     return "Lead Nurture Bot is running. Forward a lead via WhatsApp to test."
