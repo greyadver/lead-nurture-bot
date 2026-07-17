@@ -137,6 +137,23 @@ def send_whatsapp_message(to_number, body):
     )
 
 
+@app.route("/debug/backdate/<lead_id>/<int:days>")
+def debug_backdate(lead_id, days):
+    """
+    TEST-ONLY: artificially moves a lead's date back so we can trigger
+    follow-up logic immediately instead of waiting real calendar days.
+    Remove this route once testing is done.
+    """
+    leads = load_leads()
+    if lead_id not in leads:
+        return {"error": "lead_id not found"}, 404
+
+    new_date = datetime.now() - timedelta(days=days)
+    leads[lead_id]["date_received"] = new_date.isoformat()
+    save_leads(leads)
+    return {"status": "backdated", "lead_id": lead_id, "new_date": new_date.isoformat()}
+
+
 @app.route("/debug/leads")
 def debug_leads():
     """Quick way to see what's actually stored right now, for testing."""
