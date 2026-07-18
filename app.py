@@ -73,35 +73,77 @@ def whatsapp_webhook():
     return str(resp)
 
 
+SYSTEM_PROMPT = """You are a sharp real estate lead qualifier in Bangalore. Score
+the lead as HOT, WARM, or COLD based on real buying signals:
+- HOT: specific property/area mentioned, clear timeline, financing readiness
+  (loan pre-approved, cash buyer), or explicit next-step request (site visit, call)
+- WARM: general interest in an area/property type, but vague timeline, still researching
+- COLD: mass-inquiry language ("please send brochure"), no specific property mentioned
+
+Respond with ONLY one word: HOT, WARM, or COLD. Nothing else.
+"""
+
+def score_lead(message_text, max_retries=2):
+    """Quick single-word scoring - used to prioritize the status list."""
+    for attempt in range(max_retries + 1):
+        try:
+            response = groq_client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": message_text}
+                ],
+                temperature=0.3,
+                timeout=10
+            )
+            score = response.choices[0].message.content.strip().upper()
+            if score in ("HOT", "WARM", "COLD"):
+                return score
+            return "WARM"  # safe default if model returns something unexpected
+        except Exception as e:
+            print(f"  ⚠️ Scoring attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(2)
+    return "WARM"  # safe fallback if all retries fail
+
+
 def log_new_lead(from_number, incoming_msg):
     leads = load_leads()
     lead_id = f"{from_number}_{int(time.time())}"
+    score = score_lead(incoming_msg)
 
     leads[lead_id] = {
         "broker_number": from_number,
         "message": incoming_msg,
         "date_received": datetime.now().isoformat(),
         "followups_sent": [],
-        "status": "active"
+        "status": "active",
+        "score": score
     }
     save_leads(leads)
 
+    score_emoji = {"HOT": "🔥", "WARM": "🌤️", "COLD": "❄️"}
     return (
-        "Got it! I've logged this lead and will remind you when it's time to follow up — "
-        "3 days, 1 week, 3 weeks, and monthly after that. Nothing will slip through. 👍\n\n"
+        f"Got it! {score_emoji.get(score, '')} Scored as {score}.\n"
+        "I'll remind you when it's time to follow up — 3 days, 1 week, 3 weeks, "
+        "monthly after that. Nothing will slip through. 👍\n\n"
         "Reply \"status\" anytime to see all your active leads."
     )
 
 
 def get_active_leads_for_broker(from_number):
-    """Returns this broker's active (not-yet-closed) leads, oldest first,
-    in a stable order so numbering stays consistent between status/done commands."""
+    """Returns this broker's active (not-yet-closed) leads, HOT first,
+    then WARM, then COLD - so the most important ones show up on top."""
     leads = load_leads()
     active = [
         (lead_id, lead) for lead_id, lead in leads.items()
         if lead["broker_number"] == from_number and lead.get("status", "active") == "active"
     ]
-    active.sort(key=lambda item: item[1]["date_received"])
+    score_order = {"HOT": 0, "WARM": 1, "COLD": 2}
+    active.sort(key=lambda item: (
+        score_order.get(item[1].get("score", "WARM"), 1),
+        item[1]["date_received"]
+    ))
     return active
 
 
@@ -111,11 +153,13 @@ def get_status_message(from_number):
     if not active:
         return "You have no active leads being tracked right now. Forward me a lead to get started!"
 
-    lines = ["📋 Your active leads:\n"]
+    score_emoji = {"HOT": "🔥", "WARM": "🌤️", "COLD": "❄️"}
+    lines = ["📋 Your active leads (priority order):\n"]
     for i, (lead_id, lead) in enumerate(active, 1):
         days_since = (datetime.now() - datetime.fromisoformat(lead["date_received"])).days
-        snippet = lead["message"][:50] + ("..." if len(lead["message"]) > 50 else "")
-        lines.append(f"{i}. ({days_since}d ago) {snippet}")
+        snippet = lead["message"][:45] + ("..." if len(lead["message"]) > 45 else "")
+        emoji = score_emoji.get(lead.get("score", "WARM"), "")
+        lines.append(f"{i}. {emoji} ({days_since}d ago) {snippet}")
 
     lines.append("\nReply \"done 2\" to stop tracking lead #2 (or whichever number applies).")
     return "\n".join(lines)
