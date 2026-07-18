@@ -15,6 +15,7 @@ from flask import Flask, request
 from groq import Groq
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
+from supabase import create_client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,23 +23,48 @@ app = Flask(__name__)
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 twilio_client = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")  # e.g. "whatsapp:+14155238886"
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+
+supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 MODEL = "llama-3.3-70b-versatile"
-LEADS_FILE = "leads.json"
 
-# Follow-up schedule: how many days after first contact to nudge the broker
-FOLLOWUP_SCHEDULE = [3, 7, 21, 30]  # then repeats monthly after day 30
+FOLLOWUP_SCHEDULE = [3, 7, 21, 30]
 
 
 # ---------------------------------------------------------------
-# Storage helpers
+# Storage helpers — now backed by a real database (Supabase/Postgres),
+# so data survives restarts. Each function talks to just the rows it needs,
+# instead of loading/saving one giant file every time.
 # ---------------------------------------------------------------
-def load_leads():
-    return json.load(open(LEADS_FILE)) if os.path.exists(LEADS_FILE) else {}
+def insert_lead(lead_id, broker_number, message, score):
+    supabase.table("leads").insert({
+        "lead_id": lead_id,
+        "broker_number": broker_number,
+        "message": message,
+        "date_received": datetime.now().isoformat(),
+        "followups_sent": json.dumps([]),
+        "status": "active",
+        "score": score
+    }).execute()
 
-def save_leads(leads):
-    json.dump(leads, open(LEADS_FILE, "w"), indent=2)
+
+def get_active_leads_for_broker_db(broker_number):
+    result = supabase.table("leads").select("*").eq("broker_number", broker_number).eq("status", "active").execute()
+    return result.data
+
+
+def get_all_active_leads_db():
+    result = supabase.table("leads").select("*").eq("status", "active").execute()
+    return result.data
+
+
+def update_lead_status(lead_id, status):
+    supabase.table("leads").update({"status": status}).eq("lead_id", lead_id).execute()
+
+
+def update_lead_followups(lead_id, followups_sent):
+    supabase.table("leads").update({"followups_sent": json.dumps(followups_sent)}).eq("lead_id", lead_id).execute()
 
 
 # ---------------------------------------------------------------
@@ -108,19 +134,17 @@ def score_lead(message_text, max_retries=2):
 
 
 def log_new_lead(from_number, incoming_msg):
-    leads = load_leads()
+    # Edge case: broker forwards a photo/voice note with no text caption
+    if not incoming_msg.strip():
+        return (
+            "I got your message, but there's no text to log — if you forwarded a "
+            "photo or voice note, please add a short caption describing the lead "
+            "(e.g. \"3BHK HSR, budget 1.2Cr\") so I can track it properly."
+        )
+
     lead_id = f"{from_number}_{int(time.time())}"
     score = score_lead(incoming_msg)
-
-    leads[lead_id] = {
-        "broker_number": from_number,
-        "message": incoming_msg,
-        "date_received": datetime.now().isoformat(),
-        "followups_sent": [],
-        "status": "active",
-        "score": score
-    }
-    save_leads(leads)
+    insert_lead(lead_id, from_number, incoming_msg, score)
 
     score_emoji = {"HOT": "🔥", "WARM": "🌤️", "COLD": "❄️"}
     return (
@@ -134,15 +158,11 @@ def log_new_lead(from_number, incoming_msg):
 def get_active_leads_for_broker(from_number):
     """Returns this broker's active (not-yet-closed) leads, HOT first,
     then WARM, then COLD - so the most important ones show up on top."""
-    leads = load_leads()
-    active = [
-        (lead_id, lead) for lead_id, lead in leads.items()
-        if lead["broker_number"] == from_number and lead.get("status", "active") == "active"
-    ]
+    active = get_active_leads_for_broker_db(from_number)
     score_order = {"HOT": 0, "WARM": 1, "COLD": 2}
-    active.sort(key=lambda item: (
-        score_order.get(item[1].get("score", "WARM"), 1),
-        item[1]["date_received"]
+    active.sort(key=lambda lead: (
+        score_order.get(lead.get("score", "WARM"), 1),
+        lead["date_received"]
     ))
     return active
 
@@ -155,7 +175,7 @@ def get_status_message(from_number):
 
     score_emoji = {"HOT": "🔥", "WARM": "🌤️", "COLD": "❄️"}
     lines = ["📋 Your active leads (priority order):\n"]
-    for i, (lead_id, lead) in enumerate(active, 1):
+    for i, lead in enumerate(active, 1):
         days_since = (datetime.now() - datetime.fromisoformat(lead["date_received"])).days
         snippet = lead["message"][:45] + ("..." if len(lead["message"]) > 45 else "")
         emoji = score_emoji.get(lead.get("score", "WARM"), "")
@@ -176,10 +196,8 @@ def mark_lead_done(from_number, command):
     if index < 1 or index > len(active):
         return f"I don't see lead #{index}. Reply \"status\" to see your current active leads."
 
-    lead_id, lead = active[index - 1]
-    leads = load_leads()
-    leads[lead_id]["status"] = "closed"
-    save_leads(leads)
+    lead = active[index - 1]
+    update_lead_status(lead["lead_id"], "closed")
 
     return f"✅ Marked lead #{index} as done. No more follow-ups for that one."
 
@@ -191,42 +209,40 @@ def mark_lead_done(from_number, command):
 # ---------------------------------------------------------------
 @app.route("/check-followups", methods=["GET", "POST"])
 def check_followups():
-    leads = load_leads()
+    active_leads = get_all_active_leads_db()
     nudges_sent = 0
     errors = []
 
-    for lead_id, lead in leads.items():
+    for lead in active_leads:
         try:
-            if lead.get("status", "active") == "closed":
-                continue
-
+            lead_id = lead["lead_id"]
+            followups_sent = json.loads(lead.get("followups_sent") or "[]")
             date_received = datetime.fromisoformat(lead["date_received"])
             days_since = (datetime.now() - date_received).days
 
             due_day = None
             for day in FOLLOWUP_SCHEDULE:
-                if days_since >= day and day not in lead["followups_sent"]:
+                if days_since >= day and day not in followups_sent:
                     due_day = day
 
             if due_day is None and days_since > 30:
                 months_passed = days_since // 30
                 monthly_marker = f"month_{months_passed}"
-                if monthly_marker not in lead["followups_sent"]:
+                if monthly_marker not in followups_sent:
                     due_day = monthly_marker
 
             if due_day is not None:
                 nudge_text = draft_followup_nudge(lead["message"], days_since)
                 send_whatsapp_message(lead["broker_number"], nudge_text)
-                lead["followups_sent"].append(due_day)
+                followups_sent.append(due_day)
+                update_lead_followups(lead_id, followups_sent)
                 nudges_sent += 1
 
         except Exception as e:
-            # One lead failing should never stop the rest from being processed
-            print(f"  ⚠️ Failed to process lead {lead_id}: {e}")
-            errors.append(str(lead_id))
+            print(f"  ⚠️ Failed to process lead {lead.get('lead_id')}: {e}")
+            errors.append(str(lead.get("lead_id")))
             continue
 
-    save_leads(leads)
     return {"status": "ok", "nudges_sent": nudges_sent, "errors": errors}
 
 
@@ -279,7 +295,8 @@ def send_whatsapp_message(to_number, body):
 @app.route("/debug/leads")
 def debug_leads():
     """Quick way to see what's actually stored right now, for testing."""
-    return load_leads()
+    result = supabase.table("leads").select("*").execute()
+    return {"leads": result.data}
 
 
 @app.route("/")
