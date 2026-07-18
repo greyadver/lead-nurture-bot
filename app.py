@@ -42,13 +42,38 @@ def save_leads(leads):
 
 
 # ---------------------------------------------------------------
-# STEP 1: Receiving a forwarded lead on WhatsApp
+# STEP 1: Receiving a WhatsApp message — could be a new lead,
+# or a command like "status" or "done 2"
 # ---------------------------------------------------------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    incoming_msg = request.form.get("Body", "")
-    from_number = request.form.get("From", "")  # the broker's WhatsApp number
+    incoming_msg = request.form.get("Body", "").strip()
+    from_number = request.form.get("From", "")
 
+    resp = MessagingResponse()
+    command = incoming_msg.lower()
+
+    try:
+        if command in ("status", "list"):
+            resp.message(get_status_message(from_number))
+
+        elif command.startswith("done") or command.startswith("close"):
+            reply_text = mark_lead_done(from_number, command)
+            resp.message(reply_text)
+
+        else:
+            # Not a command - treat as a new lead
+            reply_text = log_new_lead(from_number, incoming_msg)
+            resp.message(reply_text)
+
+    except Exception as e:
+        print(f"  ⚠️ Error handling incoming message: {e}")
+        resp.message("Something went wrong on my end - your message wasn't lost, please try again in a moment.")
+
+    return str(resp)
+
+
+def log_new_lead(from_number, incoming_msg):
     leads = load_leads()
     lead_id = f"{from_number}_{int(time.time())}"
 
@@ -56,16 +81,63 @@ def whatsapp_webhook():
         "broker_number": from_number,
         "message": incoming_msg,
         "date_received": datetime.now().isoformat(),
-        "followups_sent": []  # tracks which schedule days we've already nudged for
+        "followups_sent": [],
+        "status": "active"
     }
     save_leads(leads)
 
-    resp = MessagingResponse()
-    resp.message(
+    return (
         "Got it! I've logged this lead and will remind you when it's time to follow up — "
-        "3 days, 1 week, 3 weeks, and monthly after that. Nothing will slip through. 👍"
+        "3 days, 1 week, 3 weeks, and monthly after that. Nothing will slip through. 👍\n\n"
+        "Reply \"status\" anytime to see all your active leads."
     )
-    return str(resp)
+
+
+def get_active_leads_for_broker(from_number):
+    """Returns this broker's active (not-yet-closed) leads, oldest first,
+    in a stable order so numbering stays consistent between status/done commands."""
+    leads = load_leads()
+    active = [
+        (lead_id, lead) for lead_id, lead in leads.items()
+        if lead["broker_number"] == from_number and lead.get("status", "active") == "active"
+    ]
+    active.sort(key=lambda item: item[1]["date_received"])
+    return active
+
+
+def get_status_message(from_number):
+    active = get_active_leads_for_broker(from_number)
+
+    if not active:
+        return "You have no active leads being tracked right now. Forward me a lead to get started!"
+
+    lines = ["📋 Your active leads:\n"]
+    for i, (lead_id, lead) in enumerate(active, 1):
+        days_since = (datetime.now() - datetime.fromisoformat(lead["date_received"])).days
+        snippet = lead["message"][:50] + ("..." if len(lead["message"]) > 50 else "")
+        lines.append(f"{i}. ({days_since}d ago) {snippet}")
+
+    lines.append("\nReply \"done 2\" to stop tracking lead #2 (or whichever number applies).")
+    return "\n".join(lines)
+
+
+def mark_lead_done(from_number, command):
+    parts = command.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return "To close a lead, reply like this: \"done 2\" (using the number from \"status\")."
+
+    index = int(parts[1])
+    active = get_active_leads_for_broker(from_number)
+
+    if index < 1 or index > len(active):
+        return f"I don't see lead #{index}. Reply \"status\" to see your current active leads."
+
+    lead_id, lead = active[index - 1]
+    leads = load_leads()
+    leads[lead_id]["status"] = "closed"
+    save_leads(leads)
+
+    return f"✅ Marked lead #{index} as done. No more follow-ups for that one."
 
 
 # ---------------------------------------------------------------
@@ -81,6 +153,9 @@ def check_followups():
 
     for lead_id, lead in leads.items():
         try:
+            if lead.get("status", "active") == "closed":
+                continue
+
             date_received = datetime.fromisoformat(lead["date_received"])
             days_since = (datetime.now() - date_received).days
 
