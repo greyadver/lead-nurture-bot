@@ -87,6 +87,15 @@ def whatsapp_webhook():
             reply_text = mark_lead_done(from_number, command)
             resp.message(reply_text)
 
+        elif command in ("help", "hi", "hello", "start"):
+            resp.message(
+                "👋 Here's what I can do:\n\n"
+                "• Forward me any lead message and I'll log + score it\n"
+                "• Reply \"status\" to see all your active leads\n"
+                "• Reply \"done 2\" to stop tracking lead #2\n\n"
+                "Try forwarding a real lead now to see it in action!"
+            )
+
         else:
             # Not a command - treat as a new lead
             reply_text = log_new_lead(from_number, incoming_msg)
@@ -103,10 +112,27 @@ SYSTEM_PROMPT = """You are a sharp real estate lead qualifier in Bangalore. Scor
 the lead as HOT, WARM, or COLD based on real buying signals:
 - HOT: specific property/area mentioned, clear timeline, financing readiness
   (loan pre-approved, cash buyer), or explicit next-step request (site visit, call)
-- WARM: general interest in an area/property type, but vague timeline, still researching
-- COLD: mass-inquiry language ("please send brochure"), no specific property mentioned
+- WARM: general interest in an area/property type, but vague timeline, still researching,
+  OR the person explicitly states interest and asks for more details (engagement signal)
+- COLD: mass-inquiry language ("please send brochure"), no specific property mentioned,
+  OR a bare price-only question with zero other context (classic multi-agent comparison
+  shopping behavior, not real engagement)
 
 Respond with ONLY one word: HOT, WARM, or COLD. Nothing else.
+
+Two important distinctions, based on real cases that are easy to get wrong:
+
+1. "might be interested eventually, send more details please" -> WARM, not COLD.
+   Even though there's no timeline, the person explicitly said "interested" and
+   actively asked for more details - that's real engagement, just early-stage.
+
+2. "what's the price of this property" (with NO other context - no stated interest,
+   no property specifics, no follow-up ask) -> COLD, not WARM.
+   A bare price question alone is classic behavior for someone comparing many
+   agents/portals at once, not a real engaged buyer.
+
+The difference: stated interest + an ask for more info = WARM. A bare transactional
+question with zero engagement language = COLD.
 """
 
 def score_lead(message_text, max_retries=2):
